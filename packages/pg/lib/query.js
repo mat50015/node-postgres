@@ -1,7 +1,7 @@
 'use strict'
 
 const { EventEmitter } = require('events')
-
+const { parse, serialize } = require('pg-protocol')
 const Result = require('./result')
 const utils = require('./utils')
 
@@ -21,6 +21,7 @@ class Query extends EventEmitter {
     this.portal = config.portal || ''
     this.callback = config.callback
     this._rowMode = config.rowMode
+    this.toBeWrittenInBuffer = [];
     if (process.domain && config.callback) {
       this.callback = process.domain.bind(config.callback)
     }
@@ -29,6 +30,7 @@ class Query extends EventEmitter {
     // potential for multiple results
     this._results = this._result
     this.isPreparedStatement = false
+    this.alreadyPrepared = false;
     this._canceledDueToError = false
     this._promise = null
   }
@@ -134,6 +136,11 @@ class Query extends EventEmitter {
     if (this._canceledDueToError) {
       return this.handleError(this._canceledDueToError, con)
     }
+    if (this.submitRes) {
+      this.submitRes();
+      this.submitP = null;
+      this.submitRes = null;
+   }
     if (this.callback) {
       try {
         this.callback(null, this._results)
@@ -163,7 +170,60 @@ class Query extends EventEmitter {
     } else {
       connection.query(this.text)
     }
-    return null
+    return null;
+  }
+
+  async queryPrepareNew(connection) {
+    this.isPreparedStatement = true
+    this.toBeWrittenInBuffer.push(await serialize.parse({
+      text: this.text,
+      name: this.name,
+      types: this.types,
+    }));
+    this.dataParsed = true;
+    try {
+      this.toBeWrittenInBuffer.push(serialize.bind({
+        portal: this.portal,
+        statement: this.name,
+        values: this.values,
+        binary: this.binary,
+        valueMapper: utils.prepareValue,
+      }));
+    } catch (err) {
+      this.handleError(err, connection)
+      return
+    }
+
+    this.toBeWrittenInBuffer.push(await serialize.describe({
+      type: 'P',
+      name: this.portal || '',
+    }));
+  }
+
+  isPreparedSomehow(connection) {
+    return this.hasBeenParsed(connection) || this.dataParsed || this.requiresPreparation() == false;
+  }
+
+  async submitNew(connection) {
+    let res;
+    let p = new Promise((resolve) => {
+      res = resolve;
+    })
+    this.submitP = p;
+    this.submitRes = res;
+    console.log("Submitting");
+    if (this.requiresPreparation()) {
+      console.log("Is of type require preparation");
+      connection.writeArray(this.toBeWrittenInBuffer);
+      this._getRows(connection, this.rows)
+    } else {
+      console.log("Does not require preparation");
+      connection.query(this.text);
+    }
+    await this.submitP;
+    console.log("Done submitting");
+    this.dataParsed = undefined;
+    this.toBeWrittenInBuffer = [];
   }
 
   hasBeenParsed(connection) {
@@ -196,7 +256,7 @@ class Query extends EventEmitter {
     this.isPreparedStatement = true
 
     // TODO refactor this poor encapsulation
-    if (!this.hasBeenParsed(connection)) {
+    if (!this.hasBeenParsed(connection) && this.alreadyPrepared == false) {
       connection.parse({
         text: this.text,
         name: this.name,

@@ -42,7 +42,6 @@ class Client extends EventEmitter {
     this._connected = false
     this._connectionError = false
     this._queryable = true
-
     this.connection =
       c.connection ||
       new Connection({
@@ -52,10 +51,14 @@ class Client extends EventEmitter {
         keepAliveInitialDelayMillis: c.keepAliveInitialDelayMillis || 0,
         encoding: this.connectionParameters.client_encoding || 'utf8',
       })
+    this.hasExecuted = false;
     this.queryQueue = []
     this.binary = c.binary || defaults.binary
+    this.usePipeline = false;
+    this.preparedQueries = [];
     this.processID = null
     this.secretKey = null
+    this.hasQueriesPrepared = false;
     this.ssl = this.connectionParameters.ssl || false
     // As with Password, make SSL->Key (the private key) non-enumerable.
     // It won't show up in stack traces
@@ -311,7 +314,9 @@ class Client extends EventEmitter {
     if (activeQuery) {
       activeQuery.handleReadyForQuery(this.connection)
     }
-    this._pulseQueryQueue()
+    if (this.usePipeline == false) {
+      this._pulseQueryQueue()
+    }
   }
 
   // if we receieve an error event or error message
@@ -478,11 +483,10 @@ class Client extends EventEmitter {
 
   _pulseQueryQueue() {
     if (this.readyForQuery === true) {
-      this.activeQuery = this.queryQueue.shift()
+      this.activeQuery = this.queryQueue.shift();
       if (this.activeQuery) {
         this.readyForQuery = false
         this.hasExecuted = true
-
         const queryError = this.activeQuery.submit(this.connection)
         if (queryError) {
           process.nextTick(() => {
@@ -496,6 +500,120 @@ class Client extends EventEmitter {
         this.emit('drain')
       }
     }
+  }
+
+  async queryPipeline(queries) {
+    console.log("Entered pipeline");
+    this.usePipeline = true;
+    let queriesComputed = [];
+    let resultList = [];
+    for (let elem of queries) {
+      let queryToInsert, result;
+      [queryToInsert, result] = this.queryForPipeline(elem.config, elem.values);
+      queriesComputed.push(queryToInsert);
+      resultList.push(result);
+    }
+    for (let i = 0; i < queriesComputed.length; i++) {
+      console.log(`Processing query ${i}`);
+      let current = queriesComputed[i];
+      this.activeQuery = current;
+      let next;
+      if (i + 1 < queriesComputed.length) {
+        next = queriesComputed[i + 1];
+      }
+      if (!current.isPreparedSomehow()) {
+        await current.queryPrepareNew(this.connection);
+      } else {
+        console.log("Already prepared");
+      }
+      let pList = [];
+      pList.push(current.submitNew(this.connection));
+      if (next) {
+        pList.push(next.queryPrepareNew(this.connection));
+      }
+      await Promise.all(pList);
+      console.log(`Done processing query ${i}`);
+    }
+    this.activeQuery = null;
+    this.emit('drain');
+    this.usePipeline = false;
+    return resultList;
+  }
+
+  queryForPipeline(config, values, callback) {
+    // can take in strings, config object or query object
+    var query
+    var result
+    var readTimeout
+    var readTimeoutTimer
+    var queryCallback
+
+    if (config === null || config === undefined) {
+      throw new TypeError('Client was passed a null or undefined query')
+    } else if (typeof config.submit === 'function') {
+      readTimeout = config.query_timeout || this.connectionParameters.query_timeout
+      result = query = config
+      if (typeof values === 'function') {
+        query.callback = query.callback || values
+      }
+    } else {
+      readTimeout = this.connectionParameters.query_timeout
+      query = new Query(config, values, callback)
+      if (!query.callback) {
+        result = new this._Promise((resolve, reject) => {
+          query.callback = (err, res) => (err ? reject(err) : resolve(res))
+        }).catch(err => {
+          // replace the stack trace that leads to `TCP.onStreamRead` with one that leads back to the
+          // application that created the query
+          Error.captureStackTrace(err);
+          throw err;
+        })
+      }
+    }
+
+    if (readTimeout) {
+      queryCallback = query.callback
+
+      readTimeoutTimer = setTimeout(() => {
+        var error = new Error('Query read timeout')
+        process.nextTick(() => {
+          query.handleError(error, this.connection)
+        })
+        queryCallback(error)
+        // we already returned an error,
+        // just do nothing if query completes
+        query.callback = () => { }
+      }, readTimeout)
+
+      query.callback = (err, res) => {
+        clearTimeout(readTimeoutTimer)
+        queryCallback(err, res)
+      }
+    }
+
+    if (this.binary && !query.binary) {
+      query.binary = true
+    }
+
+    if (query._result && !query._result._types) {
+      query._result._types = this._types
+    }
+
+    if (!this._queryable) {
+      process.nextTick(() => {
+        query.handleError(new Error('Client has encountered a connection error and is not queryable'), this.connection)
+      })
+      return result
+    }
+
+    if (this._ending) {
+      process.nextTick(() => {
+        query.handleError(new Error('Client was closed and is not queryable'), this.connection)
+      })
+      return result
+    }
+
+    return [query, result]
   }
 
   query(config, values, callback) {
@@ -543,15 +661,16 @@ class Client extends EventEmitter {
 
         // we already returned an error,
         // just do nothing if query completes
-        query.callback = () => {}
+        query.callback = () => { }
 
         // Remove from queue
         var index = this.queryQueue.indexOf(query)
         if (index > -1) {
           this.queryQueue.splice(index, 1)
         }
-
-        this._pulseQueryQueue()
+        if (this.usePipeline == false) {
+          this._pulseQueryQueue()
+        }
       }, readTimeout)
 
       query.callback = (err, res) => {
@@ -582,8 +701,10 @@ class Client extends EventEmitter {
       return result
     }
 
-    this.queryQueue.push(query)
-    this._pulseQueryQueue()
+    this.queryQueue.push(query);
+    if (this.usePipeline == false) {
+      this._pulseQueryQueue();
+    }
     return result
   }
 

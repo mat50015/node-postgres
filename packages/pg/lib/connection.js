@@ -148,7 +148,15 @@ class Connection extends EventEmitter {
     }
     return this.stream.write(buffer)
   }
-
+  writeArray(array) {
+    if (!this.stream.writable) {
+      return false
+    }
+    for (let buffer_ins of array) {
+      this.stream.write(buffer_ins);
+    }
+    return true;
+  }
   query(text) {
     this._send(serialize.query(text))
   }

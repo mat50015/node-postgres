@@ -13,7 +13,8 @@ function escapeElement(elementRepresentation) {
 // a different array separator.
 function arrayString(val) {
   var result = '{'
-  for (var i = 0; i < val.length; i++) {
+  var len = val.length;
+  for (var i = 0; i < len; i++) {
     if (i > 0) {
       result = result + ','
     }
@@ -42,6 +43,12 @@ var prepareValue = function (val, seen) {
   }
   if (val instanceof Buffer) {
     return val
+  }
+  if (typeof val == "string") {
+    return val;
+  }
+  if (typeof val == "number") {
+    return val.toString();
   }
   if (ArrayBuffer.isView(val)) {
     var buf = Buffer.from(val.buffer, val.byteOffset, val.byteLength)
@@ -170,8 +177,8 @@ const escapeIdentifier = function (str) {
 const escapeLiteral = function (str) {
   var hasBackslash = false
   var escaped = "'"
-
-  for (var i = 0; i < str.length; i++) {
+  var len = str.length;
+  for (var i = 0; i < len; i++) {
     var c = str[i]
     if (c === "'") {
       escaped += c + c
