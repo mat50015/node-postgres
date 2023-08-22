@@ -211,17 +211,13 @@ class Query extends EventEmitter {
     })
     this.submitP = p;
     this.submitRes = res;
-    console.log("Submitting");
     if (this.requiresPreparation()) {
-      console.log("Is of type require preparation");
       connection.writeArray(this.toBeWrittenInBuffer);
       this._getRows(connection, this.rows)
     } else {
-      console.log("Does not require preparation");
       connection.query(this.text);
     }
     await this.submitP;
-    console.log("Done submitting");
     this.dataParsed = undefined;
     this.toBeWrittenInBuffer = [];
   }
